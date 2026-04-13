@@ -5,6 +5,7 @@ import 'package:docman/docman.dart';
 import 'package:flutter/material.dart';
 import 'package:gal/gal.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
@@ -21,14 +22,12 @@ class StatusSaverApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final textTheme = GoogleFonts.poppinsTextTheme();
-
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'WhatsApp Status Saver',
       theme: ThemeData(
         useMaterial3: true,
-        textTheme: textTheme,
+        textTheme: GoogleFonts.poppinsTextTheme(),
         scaffoldBackgroundColor: const Color(0xFFF6F3EA),
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF0F766E),
@@ -41,25 +40,55 @@ class StatusSaverApp extends StatelessWidget {
 }
 
 class StatusItem {
-  const StatusItem({required this.document});
+  const StatusItem({
+    required this.name,
+    required this.modifiedAt,
+    required this.isVideo,
+    this.localFile,
+    this.document,
+  });
 
-  final DocumentFile document;
+  final String name;
+  final DateTime? modifiedAt;
+  final bool isVideo;
+  final File? localFile;
+  final DocumentFile? document;
 
-  String get name => document.name;
-  String get uri => document.uri;
-  bool get isVideo => name.toLowerCase().endsWith('.mp4');
-  bool get isImage {
-    final lower = name.toLowerCase();
-    return lower.endsWith('.jpg') ||
-        lower.endsWith('.jpeg') ||
-        lower.endsWith('.png') ||
-        lower.endsWith('.webp');
+  bool get isImage => !isVideo;
+  String get typeLabel => isVideo ? 'Video' : 'Image';
+  String get id => document?.uri ?? localFile!.path;
+
+  Future<File?> previewFile() async {
+    if (localFile != null) return localFile;
+    if (document == null) return null;
+    if (isVideo) {
+      return document!.thumbnailFile(width: 512, height: 512, quality: 80);
+    }
+    return document!.cache(imageQuality: 80);
   }
 
-  String get typeLabel => isVideo ? 'Video' : 'Image';
+  Future<File?> cacheFile() async {
+    if (localFile != null) return localFile;
+    return document?.cache();
+  }
 
-  DateTime? get modifiedAt => document.lastModifiedDate;
+  Future<void> share() async {
+    if (document != null) {
+      await document!.share(title: 'Share status');
+      return;
+    }
+    if (localFile == null) return;
+    final tempDoc = DocumentFile(
+      uri: localFile!.path,
+      name: name,
+      exists: true,
+      type: isVideo ? 'video/mp4' : 'image/jpeg',
+    );
+    await tempDoc.share(title: 'Share status');
+  }
 }
+
+enum AccessMode { directPermission, saf }
 
 class StatusSaverHomePage extends StatefulWidget {
   const StatusSaverHomePage({super.key});
@@ -74,18 +103,20 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
   final Map<String, Future<File?>> _previewFutures = {};
 
   bool _loading = true;
-  bool _selectingFolder = false;
   bool _refreshing = false;
+  bool _selectingFolder = false;
   String? _error;
+  String? _folderHint;
+  AccessMode? _accessMode;
+  List<StatusItem> _allStatuses = const [];
   DocumentFile? _selectedDirectory;
   DocumentFile? _statusesDirectory;
-  List<StatusItem> _allStatuses = const [];
 
   @override
   void initState() {
     super.initState();
     _tabController = TabController(length: 3, vsync: this);
-    unawaited(_restoreLastFolder());
+    unawaited(_bootstrap());
   }
 
   @override
@@ -94,42 +125,138 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
     super.dispose();
   }
 
-  Future<void> _restoreLastFolder() async {
+  Future<void> _bootstrap() async {
     setState(() {
       _loading = true;
       _error = null;
     });
 
     try {
+      final directStatuses = await _tryDirectPermissionFlow(showErrors: false);
+      if (directStatuses != null) {
+        _setDirectState(directStatuses);
+        return;
+      }
+
       final prefs = await SharedPreferences.getInstance();
       final savedUri = prefs.getString(_prefsTreeUriKey);
-      if (savedUri == null || savedUri.isEmpty) {
-        if (!mounted) return;
-        setState(() => _loading = false);
-        return;
+      if (savedUri != null && savedUri.isNotEmpty) {
+        final restored = await DocumentFile(uri: savedUri).get();
+        if (restored != null && restored.exists && restored.isDirectory) {
+          await _loadSafStatuses(restored, saveSelection: false);
+          return;
+        }
       }
 
-      final restored = await DocumentFile(uri: savedUri).get();
-      if (restored == null || !restored.exists || !restored.isDirectory) {
-        await prefs.remove(_prefsTreeUriKey);
-        if (!mounted) return;
-        setState(() {
-          _loading = false;
-          _error = 'Saved folder access expire ho gaya. Folder dobara select karo.';
-        });
-        return;
-      }
-
-      await _loadStatusesFromDirectory(restored, saveSelection: false);
-    } catch (error) {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = 'Folder restore nahi hua: $error';
+        _folderHint = 'Pehle direct permission try hui. Android 11+ par hidden status folder ke liye aksar SAF picker ki zarurat padti hai.';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = '$e';
       });
     }
   }
 
+  Future<List<StatusItem>?> _tryDirectPermissionFlow({required bool showErrors}) async {
+    final granted = await _requestDirectPermissions();
+    if (!granted) {
+      if (showErrors && mounted) {
+        setState(() {
+          _error = 'Direct permission allow nahi hui. SAF picker use karo.';
+          _folderHint = 'Android 11+ par simple allow se hidden `.Statuses` folder direct open nahi hota.';
+        });
+      }
+      return null;
+    }
+
+    final statuses = await _loadDirectStatuses();
+    if (statuses.isEmpty) {
+      if (showErrors && mounted) {
+        setState(() {
+          _error = 'Direct permission mil gayi, lekin hidden status folder direct access se read nahi hua.';
+          _folderHint = 'Is device par SAF folder selection reliable rahega.';
+        });
+      }
+      return null;
+    }
+    return statuses;
+  }
+
+  Future<bool> _requestDirectPermissions() async {
+    if (!Platform.isAndroid) return false;
+
+    final imageStatus = await Permission.photos.request();
+    final videoStatus = await Permission.videos.request();
+
+    if (imageStatus.isGranted && videoStatus.isGranted) return true;
+
+    final storageStatus = await Permission.storage.request();
+    return storageStatus.isGranted ||
+        ((await Permission.photos.status).isGranted &&
+            (await Permission.videos.status).isGranted);
+  }
+
+  Future<List<StatusItem>> _loadDirectStatuses() async {
+    final candidateDirs = <String>[
+      '/storage/emulated/0/WhatsApp/Media/.Statuses',
+      '/storage/emulated/0/WhatsApp Business/Media/.Statuses',
+      '/storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media/.Statuses',
+      '/storage/emulated/0/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/.Statuses',
+    ];
+
+    final files = <FileSystemEntity>[];
+    for (final dirPath in candidateDirs) {
+      final dir = Directory(dirPath);
+      if (!await dir.exists()) continue;
+      try {
+        files.addAll(await dir.list().toList());
+      } catch (_) {}
+    }
+
+    final statuses = files
+        .whereType<File>()
+        .where((file) {
+          final name = file.path.split(Platform.pathSeparator).last.toLowerCase();
+          return name.endsWith('.jpg') ||
+              name.endsWith('.jpeg') ||
+              name.endsWith('.png') ||
+              name.endsWith('.webp') ||
+              name.endsWith('.mp4');
+        })
+        .map((file) {
+          final stat = file.statSync();
+          final name = file.path.split(Platform.pathSeparator).last;
+          return StatusItem(
+            name: name,
+            modifiedAt: stat.modified,
+            isVideo: name.toLowerCase().endsWith('.mp4'),
+            localFile: file,
+          );
+        })
+        .toList()
+      ..sort((a, b) => (b.modifiedAt ?? DateTime(1970)).compareTo(a.modifiedAt ?? DateTime(1970)));
+
+    return statuses;
+  }
+
+  void _setDirectState(List<StatusItem> statuses) {
+    if (!mounted) return;
+    _previewFutures.clear();
+    setState(() {
+      _loading = false;
+      _accessMode = AccessMode.directPermission;
+      _allStatuses = statuses;
+      _error = statuses.isEmpty ? 'Direct access me koi status nahi mila.' : null;
+      _folderHint = 'Direct permission mode active hai. Agar kuch statuses miss hon, SAF picker use karo.';
+      _selectedDirectory = null;
+      _statusesDirectory = null;
+    });
+  }
   Future<void> _pickFolder() async {
     if (_selectingFolder) return;
 
@@ -139,31 +266,24 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
     });
 
     try {
-      final picked = await DocMan.pick.directory(
-        initDir: _selectedDirectory?.uri,
-      );
-
+      final picked = await DocMan.pick.directory(initDir: _selectedDirectory?.uri);
       if (picked == null) {
         if (!mounted) return;
         setState(() => _selectingFolder = false);
         return;
       }
-
-      await _loadStatusesFromDirectory(picked, saveSelection: true);
-    } catch (error) {
+      await _loadSafStatuses(picked, saveSelection: true);
+    } catch (e) {
       if (!mounted) return;
       setState(() {
         _selectingFolder = false;
         _loading = false;
-        _error = 'Folder select karte waqt issue aaya: $error';
+        _error = 'Folder select karte waqt issue aaya: $e';
       });
     }
   }
 
-  Future<void> _loadStatusesFromDirectory(
-    DocumentFile selected, {
-    required bool saveSelection,
-  }) async {
+  Future<void> _loadSafStatuses(DocumentFile selected, {required bool saveSelection}) async {
     setState(() {
       _loading = true;
       _selectingFolder = false;
@@ -179,7 +299,8 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
           _selectedDirectory = selected;
           _statusesDirectory = null;
           _allStatuses = const [];
-          _error = '`.Statuses` folder nahi mila. `WhatsApp/Media` ya `WhatsApp Business/Media` folder select karo.';
+          _accessMode = AccessMode.saf;
+          _error = '`.Statuses` folder nahi mila. `WhatsApp/Media` ya `Android/media/.../Media` folder select karo.';
         });
         return;
       }
@@ -191,9 +312,14 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
       final statuses = files
           .where((file) => file.isFile)
           .where((file) => !file.name.startsWith('.'))
-          .map((file) => StatusItem(document: file))
+          .map((file) => StatusItem(
+                name: file.name,
+                modifiedAt: file.lastModifiedDate,
+                isVideo: file.name.toLowerCase().endsWith('.mp4'),
+                document: file,
+              ))
           .toList()
-        ..sort((a, b) => b.document.lastModified.compareTo(a.document.lastModified));
+        ..sort((a, b) => (b.modifiedAt ?? DateTime(1970)).compareTo(a.modifiedAt ?? DateTime(1970)));
 
       if (saveSelection) {
         final prefs = await SharedPreferences.getInstance();
@@ -205,18 +331,18 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
       if (!mounted) return;
       setState(() {
         _loading = false;
+        _accessMode = AccessMode.saf;
         _selectedDirectory = selected;
         _statusesDirectory = statusesDir;
         _allStatuses = statuses;
-        _error = statuses.isEmpty
-            ? 'Status folder mil gaya, lekin abhi koi visible status nahi hai.'
-            : null;
+        _folderHint = 'SAF mode active hai. Ye Android 11+ par sabse reliable method hai.';
+        _error = statuses.isEmpty ? 'Status folder mil gaya, lekin visible status nahi mila.' : null;
       });
-    } catch (error) {
+    } catch (e) {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = 'Statuses load nahi huye: $error';
+        _error = 'Statuses load nahi huye: $e';
       });
     }
   }
@@ -253,27 +379,71 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
     final androidDir = await child(selected, 'Android');
     final mediaRoot = androidDir == null ? await child(selected, 'media') : await child(androidDir, 'media');
     if (mediaRoot != null && mediaRoot.isDirectory) {
-      final consumerDirs = <String, String>{
-        'com.whatsapp': 'WhatsApp',
-        'com.whatsapp.w4b': 'WhatsApp Business',
-      };
-
-      for (final entry in consumerDirs.entries) {
-        final packageDir = await child(mediaRoot, entry.key);
+      for (final packageName in ['com.whatsapp', 'com.whatsapp.w4b']) {
+        final packageDir = await child(mediaRoot, packageName);
         if (packageDir == null || !packageDir.isDirectory) continue;
-        final appDir = await child(packageDir, entry.value);
-        if (appDir == null || !appDir.isDirectory) continue;
-        final media = await child(appDir, 'Media');
-        if (media == null || !media.isDirectory) continue;
-        final statuses = await child(media, '.Statuses');
-        if (statuses != null && statuses.isDirectory) return statuses;
+        for (final appDirName in ['WhatsApp', 'WhatsApp Business']) {
+          final appDir = await child(packageDir, appDirName);
+          if (appDir == null || !appDir.isDirectory) continue;
+          final media = await child(appDir, 'Media');
+          if (media == null || !media.isDirectory) continue;
+          final statuses = await child(media, '.Statuses');
+          if (statuses != null && statuses.isDirectory) return statuses;
+        }
       }
     }
 
     return null;
   }
 
-  List<StatusItem> _statusesForTab() {
+  Future<void> _refresh() async {
+    if (_refreshing) return;
+    setState(() => _refreshing = true);
+
+    if (_accessMode == AccessMode.directPermission) {
+      final statuses = await _tryDirectPermissionFlow(showErrors: true);
+      if (statuses != null) {
+        _setDirectState(statuses);
+      }
+    } else if (_selectedDirectory != null) {
+      await _loadSafStatuses(_selectedDirectory!, saveSelection: false);
+    }
+
+    if (!mounted) return;
+    setState(() => _refreshing = false);
+  }
+
+  Future<void> _enableDirectPermissionMode() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    final statuses = await _tryDirectPermissionFlow(showErrors: true);
+    if (statuses != null) {
+      _setDirectState(statuses);
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _loading = false);
+  }
+
+  Future<void> _clearSavedFolder() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_prefsTreeUriKey);
+    if (!mounted) return;
+    setState(() {
+      _selectedDirectory = null;
+      _statusesDirectory = null;
+      _accessMode = null;
+      _allStatuses = const [];
+      _error = null;
+      _folderHint = null;
+      _loading = false;
+      _previewFutures.clear();
+    });
+  }
+
+  List<StatusItem> _statusesForCurrentTab() {
     switch (_tabController.index) {
       case 1:
         return _allStatuses.where((item) => item.isImage).toList();
@@ -284,46 +454,40 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
     }
   }
 
-  Future<void> _refreshStatuses() async {
-    if (_selectedDirectory == null || _refreshing) return;
-    setState(() => _refreshing = true);
-    await _loadStatusesFromDirectory(_selectedDirectory!, saveSelection: false);
-    if (!mounted) return;
-    setState(() => _refreshing = false);
+  Future<File?> _previewFile(StatusItem item) {
+    return _previewFutures.putIfAbsent(item.id, item.previewFile);
   }
 
   Future<void> _saveStatus(StatusItem item) async {
     try {
-      final cachedFile = await item.document.cache();
-      if (cachedFile == null) {
-        throw 'Temporary file create nahi hua';
-      }
+      final file = await item.cacheFile();
+      if (file == null) throw 'File unavailable';
 
       if (item.isVideo) {
-        await Gal.putVideo(cachedFile.path, album: _galleryAlbumName);
+        await Gal.putVideo(file.path, album: _galleryAlbumName);
       } else {
-        await Gal.putImage(cachedFile.path, album: _galleryAlbumName);
+        await Gal.putImage(file.path, album: _galleryAlbumName);
       }
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('${item.typeLabel} gallery me save ho gaya.')),
       );
-    } catch (error) {
+    } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Save failed: $error')),
+        SnackBar(content: Text('Save failed: $e')),
       );
     }
   }
 
   Future<void> _shareStatus(StatusItem item) async {
     try {
-      await item.document.share(title: 'Share status');
-    } catch (error) {
+      await item.share();
+    } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Share failed: $error')),
+        SnackBar(content: Text('Share failed: $e')),
       );
     }
   }
@@ -333,33 +497,9 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
       MaterialPageRoute(builder: (_) => StatusPreviewPage(item: item)),
     );
   }
-
-  Future<void> _clearFolderAccess() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_prefsTreeUriKey);
-    if (!mounted) return;
-    setState(() {
-      _selectedDirectory = null;
-      _statusesDirectory = null;
-      _allStatuses = const [];
-      _previewFutures.clear();
-      _error = null;
-      _loading = false;
-    });
-  }
-
-  Future<File?> _previewFile(StatusItem item) {
-    return _previewFutures.putIfAbsent(item.uri, () async {
-      if (item.isVideo) {
-        return item.document.thumbnailFile(width: 512, height: 512, quality: 80);
-      }
-      return item.document.cache(imageQuality: 80);
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
-    final tabItems = _statusesForTab();
+    final statuses = _statusesForCurrentTab();
 
     return Scaffold(
       body: Container(
@@ -389,8 +529,7 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
                             borderRadius: BorderRadius.circular(18),
                             border: Border.all(color: Colors.white24),
                           ),
-                          child: const Icon(Icons.auto_awesome_mosaic_rounded,
-                              color: Colors.white),
+                          child: const Icon(Icons.auto_awesome_mosaic_rounded, color: Colors.white),
                         ),
                         const SizedBox(width: 14),
                         Expanded(
@@ -406,7 +545,7 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
                               ),
                               const SizedBox(height: 4),
                               Text(
-                                'SAF based access, no broad storage permission',
+                                'Direct permission first, SAF fallback for Android 11+',
                                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
                                       color: Colors.white70,
                                     ),
@@ -415,7 +554,7 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
                           ),
                         ),
                         IconButton(
-                          onPressed: _refreshing ? null : _refreshStatuses,
+                          onPressed: _refreshing ? null : _refresh,
                           icon: _refreshing
                               ? const SizedBox(
                                   height: 20,
@@ -438,7 +577,7 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Folder Access',
+                            'Access Mode',
                             style: Theme.of(context).textTheme.titleMedium?.copyWith(
                                   fontWeight: FontWeight.w700,
                                   color: const Color(0xFF0F172A),
@@ -446,9 +585,11 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
                           ),
                           const SizedBox(height: 8),
                           Text(
-                            _selectedDirectory == null
-                                ? 'WhatsApp `Media` folder ek baar select karo. App persisted SAF access use karega.'
-                                : 'Selected: ${_selectedDirectory!.name}',
+                            _accessMode == AccessMode.directPermission
+                                ? 'Direct permission mode active'
+                                : _accessMode == AccessMode.saf
+                                    ? 'SAF folder mode active'
+                                    : 'Abhi access mode select nahi hua',
                             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                                   color: const Color(0xFF475569),
                                 ),
@@ -456,7 +597,17 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
                           if (_statusesDirectory != null) ...[
                             const SizedBox(height: 8),
                             Text(
-                              'Statuses path: ${_statusesDirectory!.name}',
+                              'Status folder: ${_statusesDirectory!.name}',
+                              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                    color: const Color(0xFF334155),
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                            ),
+                          ],
+                          if (_folderHint != null) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              _folderHint!,
                               style: Theme.of(context).textTheme.bodySmall?.copyWith(
                                     color: const Color(0xFF0F766E),
                                     fontWeight: FontWeight.w600,
@@ -468,29 +619,34 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
                             children: [
                               Expanded(
                                 child: FilledButton(
-                                  onPressed: _selectingFolder ? null : _pickFolder,
+                                  onPressed: _loading ? null : _enableDirectPermissionMode,
                                   style: FilledButton.styleFrom(
                                     backgroundColor: const Color(0xFF0F766E),
                                     foregroundColor: Colors.white,
                                     padding: const EdgeInsets.symmetric(vertical: 14),
                                   ),
-                                  child: Text(_selectedDirectory == null
-                                      ? 'Select Folder'
-                                      : 'Change Folder'),
+                                  child: const Text('Allow Permission'),
                                 ),
                               ),
                               const SizedBox(width: 10),
-                              OutlinedButton(
-                                onPressed: _selectedDirectory == null ? null : _clearFolderAccess,
-                                style: OutlinedButton.styleFrom(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 18,
-                                    vertical: 14,
+                              Expanded(
+                                child: OutlinedButton(
+                                  onPressed: _selectingFolder ? null : _pickFolder,
+                                  style: OutlinedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(vertical: 14),
                                   ),
+                                  child: const Text('Pick Folder'),
                                 ),
-                                child: const Text('Reset'),
                               ),
                             ],
+                          ),
+                          const SizedBox(height: 10),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: TextButton(
+                              onPressed: _clearSavedFolder,
+                              child: const Text('Reset Access'),
+                            ),
                           ),
                         ],
                       ),
@@ -519,9 +675,7 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
                           Tab(text: 'Videos'),
                         ],
                       ),
-                      Expanded(
-                        child: _buildBody(tabItems),
-                      ),
+                      Expanded(child: _buildBody(statuses)),
                     ],
                   ),
                 ),
@@ -538,21 +692,11 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
       return const Center(child: CircularProgressIndicator());
     }
 
-    if (_selectedDirectory == null) {
-      return _EmptyState(
-        title: 'Folder select karo',
-        message:
-            'Android 11+ me hidden WhatsApp statuses dekhne ke liye system folder picker se access dena padega.',
-        buttonLabel: 'Choose WhatsApp Folder',
-        onPressed: _pickFolder,
-      );
-    }
-
     if (_error != null && _allStatuses.isEmpty) {
       return _EmptyState(
-        title: 'Statuses unavailable',
+        title: 'Access required',
         message: _error!,
-        buttonLabel: 'Pick Again',
+        buttonLabel: 'Pick Folder',
         onPressed: _pickFolder,
       );
     }
@@ -560,9 +704,9 @@ class _StatusSaverHomePageState extends State<StatusSaverHomePage>
     if (statuses.isEmpty) {
       return _EmptyState(
         title: 'No statuses',
-        message: 'Current tab me koi status item nahi mila. Refresh ya tab change karke dekho.',
+        message: 'Permission ya folder access ke baad bhi abhi koi visible status nahi mila.',
         buttonLabel: 'Refresh',
-        onPressed: _refreshStatuses,
+        onPressed: _refresh,
       );
     }
 
@@ -629,12 +773,9 @@ class _StatusCard extends StatelessWidget {
                             if (snapshot.connectionState != ConnectionState.done) {
                               return Container(
                                 color: const Color(0xFFE2E8F0),
-                                child: const Center(
-                                  child: CircularProgressIndicator(strokeWidth: 2),
-                                ),
+                                child: const Center(child: CircularProgressIndicator(strokeWidth: 2)),
                               );
                             }
-
                             final file = snapshot.data;
                             if (file == null) {
                               return Container(
@@ -646,7 +787,6 @@ class _StatusCard extends StatelessWidget {
                                 ),
                               );
                             }
-
                             return Image.file(file, fit: BoxFit.cover);
                           },
                         ),
@@ -661,23 +801,12 @@ class _StatusCard extends StatelessWidget {
                           color: Colors.black.withValues(alpha: 0.6),
                           borderRadius: BorderRadius.circular(999),
                         ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              item.isVideo ? Icons.videocam_rounded : Icons.photo_rounded,
-                              color: Colors.white,
-                              size: 14,
-                            ),
-                            const SizedBox(width: 4),
-                            Text(
-                              item.typeLabel,
-                              style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                            ),
-                          ],
+                        child: Text(
+                          item.typeLabel,
+                          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                              ),
                         ),
                       ),
                     ),
@@ -696,12 +825,8 @@ class _StatusCard extends StatelessWidget {
               ),
               const SizedBox(height: 4),
               Text(
-                item.modifiedAt == null
-                    ? 'Unknown date'
-                    : _formatDate(item.modifiedAt!),
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: const Color(0xFF64748B),
-                    ),
+                item.modifiedAt == null ? 'Unknown date' : _formatDate(item.modifiedAt!),
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
               ),
               const SizedBox(height: 10),
               Row(
@@ -730,7 +855,6 @@ class _StatusCard extends StatelessWidget {
     );
   }
 }
-
 class StatusPreviewPage extends StatefulWidget {
   const StatusPreviewPage({super.key, required this.item});
 
@@ -760,10 +884,8 @@ class _StatusPreviewPageState extends State<StatusPreviewPage> {
 
   Future<void> _prepare() async {
     try {
-      final file = await widget.item.document.cache();
-      if (file == null) {
-        throw 'Preview file unavailable';
-      }
+      final file = await widget.item.cacheFile();
+      if (file == null) throw 'Preview file unavailable';
 
       VideoPlayerController? controller;
       if (widget.item.isVideo) {
@@ -779,11 +901,11 @@ class _StatusPreviewPageState extends State<StatusPreviewPage> {
         _videoController = controller;
         _loading = false;
       });
-    } catch (error) {
+    } catch (e) {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = '$error';
+        _error = '$e';
       });
     }
   }
@@ -797,32 +919,17 @@ class _StatusPreviewPageState extends State<StatusPreviewPage> {
         foregroundColor: Colors.white,
         title: Text(widget.item.typeLabel),
       ),
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(18),
-          child: Center(
-            child: _loading
-                ? const CircularProgressIndicator(color: Colors.white)
-                : _error != null
-                    ? Text(
-                        _error!,
-                        style: const TextStyle(color: Colors.white),
-                        textAlign: TextAlign.center,
+      body: Center(
+        child: _loading
+            ? const CircularProgressIndicator(color: Colors.white)
+            : _error != null
+                ? Text(_error!, style: const TextStyle(color: Colors.white))
+                : widget.item.isVideo
+                    ? AspectRatio(
+                        aspectRatio: _videoController!.value.aspectRatio,
+                        child: VideoPlayer(_videoController!),
                       )
-                    : widget.item.isVideo
-                        ? ClipRRect(
-                            borderRadius: BorderRadius.circular(24),
-                            child: AspectRatio(
-                              aspectRatio: _videoController!.value.aspectRatio,
-                              child: VideoPlayer(_videoController!),
-                            ),
-                          )
-                        : ClipRRect(
-                            borderRadius: BorderRadius.circular(24),
-                            child: Image.file(_file!, fit: BoxFit.contain),
-                          ),
-          ),
-        ),
+                    : Image.file(_file!, fit: BoxFit.contain),
       ),
     );
   }
@@ -870,15 +977,10 @@ class _EmptyState extends StatelessWidget {
             Text(
               message,
               textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: const Color(0xFF64748B),
-                  ),
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
             ),
             const SizedBox(height: 18),
-            FilledButton(
-              onPressed: onPressed,
-              child: Text(buttonLabel),
-            ),
+            FilledButton(onPressed: onPressed, child: Text(buttonLabel)),
           ],
         ),
       ),
@@ -895,3 +997,5 @@ String _formatDate(DateTime date) {
   final suffix = date.hour >= 12 ? 'PM' : 'AM';
   return '$day/$month/$year  $hour:$minute $suffix';
 }
+
+
